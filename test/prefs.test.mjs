@@ -186,6 +186,16 @@ test("answer language: saved from Chat settings and used in every prompt", () =>
 	assert.equal(plugin.getLanguage(), "", "unknown values fall back to the question's language");
 });
 
+test("fullPdfAccess switch toggles the pref", () => {
+	const { container, prefs } = pane();
+	const chat = card(container, "Chat");
+	const toggle = rowControl(chat, "Full PDF access").querySelector(".zs-switch");
+	assert.equal(toggle.getAttribute("aria-checked"), "false");
+	toggle.click();
+	assert.equal(prefs[PREFIX + "fullPdfAccess"], true);
+	assert.equal(toggle.getAttribute("aria-checked"), "true");
+});
+
 test("tiles: a visual radio group of icon cards", () => {
 	const { plugin, document } = pane();
 	let picked = null;

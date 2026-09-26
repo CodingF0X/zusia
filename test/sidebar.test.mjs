@@ -146,6 +146,13 @@ test("paper chip renders into the composer and hides without a paper", () => {
 	assert.equal(root.querySelector(".zs-context").hidden, true);
 });
 
+test("paper chip reflects fullPdfAccess pref when enabled", () => {
+	const { root, plugin } = sidebar({ "extensions.zusia.fullPdfAccess": true });
+	plugin.renderPaperChip(root, { label: "Dohare et al., 2024", title: "Loss of plasticity" });
+	const chip = root.querySelector(".zs-composer .zs-context-chip");
+	assert.match(chip.title, /entire PDF file/);
+});
+
 test("error card: short errors open, long ones collapse, retry runs the callback", () => {
 	const { view, plugin } = sidebar();
 	let retried = 0;
