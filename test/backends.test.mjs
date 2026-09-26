@@ -261,3 +261,15 @@ test("clarifications: nothing is saved without a selection or when the request f
 	await p.ask(base.ctx, "Explain", failing);
 	assert.equal(count, 0);
 });
+
+test("fullPdfAccess: prompts mention paper.txt and paper.pdf when enabled", () => {
+	const { plugin: p } = loadPlugin({ prefs: { "extensions.zusia.fullPdfAccess": true } });
+	assert.match(p.systemPrompt(), /paper\.txt/);
+	assert.match(p.systemPrompt(), /paper\.pdf/);
+	assert.match(p.systemPrompt(), /full access to the entire paper/);
+	const prompt = p.buildAntigravityPrompt({ ...base, files: { ...base.files, paperText: "Full text content" } });
+	assert.match(prompt, /paper\.txt/);
+	assert.match(prompt, /paper\.pdf/);
+	assert.match(prompt, /full access to the entire paper/);
+	assert.match(prompt, /<metadata>\n# T\n<\/metadata>/);
+});

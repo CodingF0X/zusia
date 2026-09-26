@@ -83,6 +83,7 @@
 | 🔵 | **Search** | 🔍 searches the chats of every paper |
 | 🟢 | **Models** | Pick assistant, model and reasoning effort from the message box |
 | ⚫ | **Setup** | A visual wizard on first run |
+| 🟡 | **Full paper access** | Toggle in Settings → Chat to let assistants read the full PDF without selecting passages |
 
 ## Install
 
@@ -96,8 +97,9 @@ Updates arrive on their own after that: Zotero checks the release feed.
 ## Privacy
 
 - 🖥️ The assistants run **on your computer** with your own login. No server, no API keys.
-- 📄 They get the paper's **metadata and your annotations**, never the PDF's full text. Plus any image you attach.
+- 📄 By default, they get the paper's **metadata and your annotations**, not the PDF's full text. You can optionally enable **Full PDF access** in Settings → Chat to let assistants read the full document. Plus any image you attach.
 - 📁 Chats, clarifications and images stay in `zusia/` inside Zotero's data folder.
+- 📖 See [CHANGELOG.md](CHANGELOG.md) for full details on full PDF access, caching, and token utilization.
 
 <p align="center"><img src="docs/rule.svg" alt="" width="100%"></p>
 

@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const read = path => readFileSync(new URL("../" + path, import.meta.url), "utf8");
 const exists = path => existsSync(new URL("../" + path, import.meta.url));
@@ -107,7 +108,7 @@ test("the update manifest points at the release the tag will create", async () =
 	const manifest = JSON.parse(read("src/manifest.json"));
 	assert.match(manifest.applications.zotero.update_url, /^https:\/\/github\.com\/firekern\/zusia\/releases\/latest\/download\/updates\.json$/);
 	const { execFileSync } = await import("node:child_process");
-	execFileSync(process.execPath, [new URL("../scripts/updates.mjs", import.meta.url).pathname]);
+	execFileSync(process.execPath, [fileURLToPath(new URL("../scripts/updates.mjs", import.meta.url))]);
 	const updates = JSON.parse(read("updates.json")).addons[manifest.applications.zotero.id].updates[0];
 	assert.equal(updates.version, manifest.version);
 	assert.equal(updates.update_link, `https://github.com/firekern/zusia/releases/download/v${manifest.version}/zusia.xpi`);

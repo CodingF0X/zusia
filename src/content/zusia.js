@@ -673,9 +673,13 @@ Zusia = {
 		return (this.getPref("explainPrompt") || "").trim() || this.DEFAULT_EXPLAIN_PROMPT;
 	},
 
+	getFullPdfAccess() {
+		return !!this.getPref("fullPdfAccess");
+	},
+
 	// Settings changed in the Settings window update every open sidebar at once.
 	watchPrefs() {
-		let names = ["appearance", "prompts", "backend", "codex.models", "modeButtons", "language", "behaviour", "onboarded"];
+		let names = ["appearance", "prompts", "backend", "codex.models", "modeButtons", "language", "behaviour", "onboarded", "fullPdfAccess"];
 		for (let id of Object.keys(this.MODES)) {
 			names.push("mode." + id);
 		}
@@ -1589,6 +1593,20 @@ Zusia = {
 					});
 				},
 			});
+			let hasPdf = !!(view.ctx?.attachmentItem?.isPDFAttachment?.() || reader);
+			this.menuItem(doc, menu, {
+				label: "Ask about entire paper…",
+				desc: hasPdf ? "Prefill a question about the whole PDF" : "Open a PDF to ask about it",
+				disabled: !hasPdf,
+				onSelect: () => {
+					this.closeMenu(root);
+					if (!view.input.value.trim()) {
+						view.input.value = "From the whole paper, ";
+						this.autoGrow(view.input);
+					}
+					view.input.focus();
+				},
+			});
 			if (Zotero.isMac) {
 				this.menuItem(doc, menu, {
 					label: "Take screenshot",
@@ -1661,8 +1679,11 @@ Zusia = {
 		}
 		let doc = root.ownerDocument;
 		let chip = this.el(doc, "span", "zs-context-chip");
+		let fullPdf = this.getFullPdfAccess();
 		chip.title = (info.title ? info.title + "\n" : "") +
-			"Answers use the title, authors, abstract and your annotations, not the PDF text";
+			(fullPdf
+				? "Answers use the entire PDF file, metadata and your annotations"
+				: "Answers use the title, authors, abstract and your annotations, not the PDF text");
 		chip.append(this.svgIcon(doc, "paper", "zs-context-icon"), this.el(doc, "span", "zs-context-label", info.label));
 		holder.appendChild(chip);
 	},
@@ -1992,6 +2013,9 @@ Zusia = {
 			return;
 		}
 		this._views.set(root, view);
+		if (this.getFullPdfAccess()) {
+			this.exportContext(ctx).catch(e => this.log("pre-export context: " + e));
+		}
 		this.renderPaperChip(root, this.paperInfo(ctx));
 		this.renderAttachments(view);
 		this.renderMessages(view, history);
@@ -3540,6 +3564,12 @@ Zusia = {
 
 	buildChatCard(doc) {
 		let card = this.card(doc, "Chat", "Quick prompts appear as buttons above the message box.");
+
+		let fullPdfSwitch = this.switchControl(doc, this.getFullPdfAccess(), (checked) => {
+			this.setPref("fullPdfAccess", checked);
+		});
+		card.body.appendChild(this.row(doc, "Full PDF access", fullPdfSwitch,
+			"Allow assistants to access the entire PDF file and full text, enabling general questions without selecting a passage."));
 
 		let languageSelect = this.select(doc,
 			this.LANGUAGES.map(language => [language, language || "Same as my question"]),
@@ -5137,15 +5167,6 @@ Zusia = {
 		let metadata = lines.join("\n") + "\n";
 		await Zotero.File.putContentsAsync(OS.Path.join(dir, "metadata.md"), metadata);
 
-		// The PDF text is never given to the assistants. Earlier versions exported it
-		// as paper.txt: remove it, and forget the sessions that may have read it.
-		let paperPath = OS.Path.join(dir, "paper.txt");
-		if (await OS.File.exists(paperPath)) {
-			await OS.File.remove(paperPath);
-			await this.saveSessions(dir, {});
-			this.log("exportContext: removed paper.txt and reset sessions in " + dir);
-		}
-
 		let annotations = "";
 		if (attachmentItem && attachmentItem.isFileAttachment && attachmentItem.isFileAttachment()) {
 			let items = attachmentItem.getAnnotations();
@@ -5169,7 +5190,335 @@ Zusia = {
 		}
 		await Zotero.File.putContentsAsync(OS.Path.join(dir, "annotations.md"), annotations);
 
-		return { metadata, annotations };
+		let fullPdf = this.getFullPdfAccess();
+		let paperPath = OS.Path.join(dir, "paper.txt");
+		let paperPdfPath = OS.Path.join(dir, "paper.pdf");
+		let paperText = "";
+		let pdfPath = null;
+
+		if (!fullPdf) {
+			if (await OS.File.exists(paperPath)) {
+				await OS.File.remove(paperPath);
+				await this.saveSessions(dir, {});
+				this.log("exportContext: removed paper.txt and reset sessions in " + dir);
+			}
+			if (await OS.File.exists(paperPdfPath)) {
+				await OS.File.remove(paperPdfPath);
+			}
+			return { metadata, annotations, paperText: "", hasPdf: false };
+		}
+
+		if ((!attachmentItem || !attachmentItem.isPDFAttachment || !attachmentItem.isPDFAttachment()) && paperItem && paperItem.getAttachments) {
+			for (let id of paperItem.getAttachments()) {
+				let att = Zotero.Items.get(id);
+				if (att && att.isPDFAttachment && att.isPDFAttachment()) {
+					attachmentItem = att;
+					ctx.attachmentItem = att;
+					break;
+				}
+			}
+		}
+
+		if (attachmentItem && attachmentItem.isPDFAttachment && attachmentItem.isPDFAttachment()) {
+			try {
+				pdfPath = await attachmentItem.getFilePathAsync();
+			}
+			catch (e) {
+				pdfPath = attachmentItem.getFilePath ? attachmentItem.getFilePath() : null;
+			}
+		}
+
+		if (pdfPath) {
+			try {
+				if (await OS.File.exists(pdfPath)) {
+					let rawBytes = await OS.File.read(pdfPath);
+					let pdfStart = -1;
+					let searchLimit = Math.min(rawBytes.length - 5, 2048);
+					for (let i = 0; i <= searchLimit; i++) {
+						if (rawBytes[i] === 0x25 && // %
+						    rawBytes[i + 1] === 0x50 && // P
+						    rawBytes[i + 2] === 0x44 && // D
+						    rawBytes[i + 3] === 0x46 && // F
+						    rawBytes[i + 4] === 0x2D) { // -
+							pdfStart = i;
+							break;
+						}
+					}
+					let cleanBytes = rawBytes;
+					if (pdfStart > 0) {
+						let pdfEnd = rawBytes.length;
+						for (let i = rawBytes.length - 5; i >= pdfStart; i--) {
+							if (rawBytes[i] === 0x25 && // %
+							    rawBytes[i + 1] === 0x25 && // %
+							    rawBytes[i + 2] === 0x45 && // E
+							    rawBytes[i + 3] === 0x4F && // O
+							    rawBytes[i + 4] === 0x46) { // F
+								pdfEnd = i + 5;
+								if (pdfEnd < rawBytes.length && (rawBytes[pdfEnd] === 0x0A || rawBytes[pdfEnd] === 0x0D)) {
+									pdfEnd++;
+								}
+								break;
+							}
+						}
+						cleanBytes = rawBytes.subarray(pdfStart, pdfEnd);
+						this.log("exportContext: stripped " + pdfStart + " leading bytes from multipart PDF wrapper");
+					}
+
+					let needWrite = true;
+					if (await OS.File.exists(paperPdfPath)) {
+						let dstStat = await OS.File.stat(paperPdfPath);
+						if (dstStat.size === cleanBytes.length) {
+							needWrite = false;
+						}
+					}
+					if (needWrite) {
+						await OS.File.writeAtomic(paperPdfPath, cleanBytes);
+						this.log("exportContext: wrote clean paper.pdf (" + cleanBytes.length + " bytes) to " + dir);
+					}
+				}
+			}
+			catch (e) {
+				this.log("exportContext: copy paper.pdf failed: " + e);
+			}
+		}
+
+		let paperTextBefore = "";
+		try {
+			if (await OS.File.exists(paperPath)) {
+				let stat = await OS.File.stat(paperPath);
+				if (stat.size > 0) {
+					paperTextBefore = await Zotero.File.getContentsAsync(paperPath);
+				}
+			}
+			if (!paperTextBefore) {
+				paperText = await this.extractPdfText(ctx, pdfPath);
+				if (paperText && paperText.trim()) {
+					await Zotero.File.putContentsAsync(paperPath, paperText);
+					this.log("exportContext: wrote paper.txt (" + paperText.length + " chars) to " + dir);
+					await this.saveSessions(dir, {});
+					this.log("exportContext: reset sessions in " + dir + " to include full paper text");
+				}
+			}
+			else {
+				paperText = paperTextBefore;
+			}
+		}
+		catch (e) {
+			this.log("exportContext: extract paper.txt failed: " + e);
+		}
+
+		return { metadata, annotations, paperText, pdfPath, hasPdf: !!(pdfPath || paperText) };
+	},
+
+	formatPdfText(rawText) {
+		if (!rawText || !rawText.trim()) {
+			return "";
+		}
+		if (rawText.includes("\f")) {
+			let pages = rawText.split("\f").map((p, idx) => {
+				let t = p.trim();
+				return t ? "## Page " + (idx + 1) + "\n\n" + t : "";
+			}).filter(Boolean);
+			if (pages.length) {
+				return pages.join("\n\n");
+			}
+		}
+		return rawText.trim();
+	},
+
+	async extractPdfText(ctx, pdfPath = null) {
+		let paperPath = OS.Path.join(ctx.dir, "paper.txt");
+		if (await OS.File.exists(paperPath)) {
+			try {
+				let existing = await Zotero.File.getContentsAsync(paperPath);
+				if (existing && existing.trim()) {
+					return existing;
+				}
+			}
+			catch (e) {}
+		}
+
+		// 1. Check if Zotero already extracted and cached full text in .zotero-ft-cache
+		if (pdfPath) {
+			try {
+				let parentDir = typeof PathUtils !== "undefined" && PathUtils.parent ? PathUtils.parent(pdfPath) : OS.Path.dirname(pdfPath);
+				let ftCachePath = OS.Path.join(parentDir, ".zotero-ft-cache");
+				if (await OS.File.exists(ftCachePath)) {
+					let cached = await Zotero.File.getContentsAsync(ftCachePath);
+					if (cached && cached.trim()) {
+						this.log("extractPdfText: loaded from .zotero-ft-cache (" + cached.length + " chars)");
+						return this.formatPdfText(cached);
+					}
+				}
+			}
+			catch (e) {
+				this.log("extractPdfText: checking .zotero-ft-cache failed: " + e);
+			}
+		}
+
+		// 2. Try Zotero's built-in background PDFWorker (runs in worker thread, no DOM required)
+		let attachmentItem = ctx.attachmentItem;
+		if (attachmentItem && attachmentItem.id && typeof Zotero !== "undefined" && Zotero.PDFWorker && Zotero.PDFWorker.getFullText) {
+			try {
+				this.log("extractPdfText: extracting via Zotero.PDFWorker for item " + attachmentItem.id);
+				let res = await Zotero.PDFWorker.getFullText(attachmentItem.id, null);
+				if (res && res.text && res.text.trim()) {
+					this.log("extractPdfText: extracted via Zotero.PDFWorker (" + res.text.length + " chars)");
+					return this.formatPdfText(res.text);
+				}
+			}
+			catch (e) {
+				this.log("extractPdfText: Zotero.PDFWorker extraction error: " + e);
+			}
+		}
+
+		// 3. Try open Reader tab in Zotero (unwrapping Gecko Xrays)
+		let reader = this.readerFor(ctx);
+		if (reader) {
+			try {
+				let internal = reader._internalReader;
+				let pdfView = internal && (internal._lastView || internal._primaryView);
+				let frame = pdfView && pdfView._iframeWindow;
+				if (frame) {
+					let win = (typeof Cu !== "undefined" && Cu.waiveXrays ? Cu.waiveXrays(frame) : null) || frame.wrappedJSObject || frame;
+					let viewer = win.PDFViewerApplication;
+					let pdfDoc = viewer && viewer.pdfDocument;
+					if (viewer && !pdfDoc && viewer.pdfLoadingTask) {
+						try {
+							pdfDoc = await viewer.pdfLoadingTask.promise;
+						}
+						catch (e) {}
+					}
+					if (pdfDoc) {
+						let text = await this.extractTextFromPdfDoc(pdfDoc);
+						if (text && text.trim()) {
+							this.log("extractPdfText: extracted via Reader (" + text.length + " chars)");
+							return text;
+						}
+					}
+				}
+			}
+			catch (e) {
+				this.log("extractPdfText: reader extraction error: " + e);
+			}
+		}
+
+		// 4. Try PDF.js loaded in Zotero, passing binary Uint8Array data directly
+		try {
+			let pdfjs = null;
+			for (let r of (Zotero.Reader?._readers || [])) {
+				let frame = r?._internalReader?._lastView?._iframeWindow;
+				let win = (typeof Cu !== "undefined" && Cu.waiveXrays ? Cu.waiveXrays(frame) : null) || frame?.wrappedJSObject || frame;
+				if (win && win.pdfjsLib) {
+					pdfjs = win.pdfjsLib;
+					break;
+				}
+			}
+			if (!pdfjs) {
+				try {
+					let mod = ChromeUtils.importESModule("resource://zotero/reader/pdf/build/pdf.mjs");
+					pdfjs = mod.pdfjsLib || mod;
+				}
+				catch (e) {}
+			}
+			if (!pdfjs && typeof Services !== "undefined" && Services.scriptloader) {
+				try {
+					let scope = {};
+					Services.scriptloader.loadSubScript("resource://zotero/reader/pdf/build/pdf.js", scope);
+					pdfjs = scope.pdfjsLib;
+				}
+				catch (e) {}
+			}
+			if (pdfjs && pdfPath && (await OS.File.exists(pdfPath))) {
+				let rawBytes = await OS.File.read(pdfPath);
+				let loadingTask = pdfjs.getDocument({ data: rawBytes });
+				let pdfDoc = await loadingTask.promise;
+				if (pdfDoc && pdfDoc.numPages) {
+					let text = await this.extractTextFromPdfDoc(pdfDoc);
+					if (text && text.trim()) {
+						this.log("extractPdfText: extracted via pdfjsLib (" + text.length + " chars)");
+						return text;
+					}
+				}
+			}
+		}
+		catch (e) {
+			this.log("extractPdfText: pdfjs error: " + e);
+		}
+
+		// 5. Try external pdftotext binary if available on system
+		if (pdfPath) {
+			try {
+				let pdftotext = await this.findBinary("pdftotext");
+				if (pdftotext) {
+					let outPath = OS.Path.join(ctx.dir, "paper.txt");
+					let { exitCode } = await this.runProcess(pdftotext, ["-layout", pdfPath, outPath], ctx.dir);
+					if (exitCode === 0 && (await OS.File.exists(outPath))) {
+						return await Zotero.File.getContentsAsync(outPath);
+					}
+				}
+			}
+			catch (e) {}
+		}
+
+		return "";
+	},
+
+	async extractTextFromPdfDoc(pdfDoc) {
+		let doc = (typeof Cu !== "undefined" && Cu.waiveXrays ? Cu.waiveXrays(pdfDoc) : null) || pdfDoc.wrappedJSObject || pdfDoc;
+		let numPages = doc.numPages;
+		if (!numPages) {
+			return "";
+		}
+		let pages = [];
+		for (let i = 1; i <= numPages; i++) {
+			try {
+				let page = await doc.getPage(i);
+				let rawPage = (typeof Cu !== "undefined" && Cu.waiveXrays ? Cu.waiveXrays(page) : null) || page.wrappedJSObject || page;
+				let getTextContent = rawPage.getTextContent || (page && page.getTextContent);
+				if (typeof getTextContent !== "function") {
+					this.log("extractTextFromPdfDoc page " + i + ": getTextContent is not a function");
+					continue;
+				}
+				let content = await getTextContent.call(rawPage);
+				let rawContent = (typeof Cu !== "undefined" && Cu.waiveXrays ? Cu.waiveXrays(content) : null) || content.wrappedJSObject || content;
+				let items = rawContent.items || [];
+				items = (typeof Cu !== "undefined" && Cu.waiveXrays ? Cu.waiveXrays(items) : null) || items.wrappedJSObject || items;
+				let lastY;
+				let lines = [];
+				let currentLine = "";
+				for (let item of items) {
+					let rawItem = (typeof Cu !== "undefined" && Cu.waiveXrays ? Cu.waiveXrays(item) : null) || item.wrappedJSObject || item;
+					if (!rawItem.str && !rawItem.hasEOL) {
+						continue;
+					}
+					let y = rawItem.transform ? rawItem.transform[5] : undefined;
+					if (rawItem.hasEOL || (y !== undefined && lastY !== undefined && Math.abs(y - lastY) > 5)) {
+						if (currentLine.trim()) {
+							lines.push(currentLine.trim());
+						}
+						currentLine = rawItem.str || "";
+					}
+					else {
+						currentLine += (currentLine.length && !currentLine.endsWith(" ") && rawItem.str ? " " : "") + (rawItem.str || "");
+					}
+					if (y !== undefined) {
+						lastY = y;
+					}
+				}
+				if (currentLine.trim()) {
+					lines.push(currentLine.trim());
+				}
+				let pageText = lines.join("\n").trim();
+				if (pageText) {
+					pages.push("## Page " + i + "\n\n" + pageText);
+				}
+			}
+			catch (e) {
+				this.log("extractTextFromPdfDoc page " + i + " failed: " + e);
+			}
+		}
+		return pages.join("\n\n");
 	},
 
 	// ---------------------------------------------------------------------
@@ -5344,14 +5693,25 @@ Zusia = {
 	},
 
 	systemPrompt() {
+		let fullPdf = this.getFullPdfAccess();
+		let contextDesc = fullPdf
+			? "The working directory contains metadata.md (title, authors, date, abstract), " +
+			  "annotations.md (the user's highlights and notes, may be empty), paper.txt (the " +
+			  "full text of the entire paper), and paper.pdf (the PDF document). You have " +
+			  "full access to the entire paper. When asked general questions about the paper or " +
+			  "specific questions about sections, methods, equations, theorems, figures, or " +
+			  "results, use paper.txt or paper.pdf to inspect the document and answer accurately. "
+			: "The working directory contains metadata.md (title, authors, date, abstract) and " +
+			  "annotations.md (the user's highlights and notes, may be empty). The paper's full " +
+			  "text is deliberately not provided: answer from these files and your own knowledge, " +
+			  "and say so when a question needs details only the full text would have. ";
+
 		return (
 			"You are embedded in the Zotero reference manager as a sidebar assistant, helping " +
-			"the user understand the paper they are currently viewing. The working directory " +
-			"contains metadata.md (title, authors, date, abstract) and annotations.md (the " +
-			"user's highlights and notes, may be empty). The paper's full text is deliberately " +
-			"not provided: answer from these files and your own knowledge, and say so when a " +
-			"question needs details only the full text would have. Do not modify any files. " +
-			"Keep answers focused on this paper. " + this.languageInstruction() + " " +
+			"the user understand the paper they are currently viewing. " +
+			contextDesc +
+			"Do not modify any files. Keep answers focused on this paper. " +
+			this.languageInstruction() + " " +
 			this.behaviourInstructions() + "\n\n" +
 			this.formattingGuide()
 		);
@@ -5548,7 +5908,7 @@ Zusia = {
 	},
 
 	antigravityArgs(request) {
-		let args = ["--output-format", "stream-json", "--sandbox"];
+		let args = ["--output-format", "stream-json", "--sandbox", "--dangerously-skip-permissions"];
 		if (request.model) {
 			args.push("--model", request.model);
 		}
@@ -5729,22 +6089,41 @@ Zusia = {
 		return { text, error: text ? "" : errorText, sessionId };
 	},
 
-	// Antigravity cannot be granted read-only file access in headless mode, so a
-	// new session receives the metadata and annotations inline instead.
+	// The working directory contains metadata.md, annotations.md, paper.txt and paper.pdf.
+	// We reference them in the prompt so agy can inspect them using tools without overflowing
+	// the Win32 CreateProcess 32KB command-line length limit.
 	buildAntigravityPrompt({ files, question, history, session }) {
 		let tail = this.transcriptFor(history, session) + question + this.formattingReminder();
 		if (session) {
 			return tail;
 		}
+		let fullPdf = this.getFullPdfAccess() && files && (files.paperText || files.hasPdf);
+		let intro = fullPdf
+			? "You are embedded in the Zotero reference manager as a sidebar assistant, helping the " +
+			  "user understand one paper. The working directory contains metadata.md (title, authors, " +
+			  "date, abstract), annotations.md (the user's highlights and notes, may be empty), " +
+			  "paper.txt (the full text of the entire paper), and paper.pdf (the PDF document). " +
+			  "You have full access to the entire paper. When asked general questions about the paper or " +
+			  "specific questions about sections, methods, equations, theorems, figures, or results, " +
+			  "use paper.txt or paper.pdf to inspect the document and answer accurately. " +
+			  "Do not modify any files. Keep answers focused on this paper. "
+			: "You are embedded in the Zotero reference manager as a sidebar assistant, helping the " +
+			  "user understand one paper. The working directory contains metadata.md (title, authors, " +
+			  "date, abstract) and annotations.md (the user's highlights and notes, may be empty). " +
+			  "The paper's full text is deliberately not provided: answer from these and your own " +
+			  "knowledge, and say so when a question needs details only the full text would have. " +
+			  "Keep answers focused on this paper. ";
+
+		let annotations = files && files.annotations ? files.annotations : "";
+		if (annotations.length > 8000) {
+			annotations = annotations.slice(0, 8000) + "\n\n[... Remaining annotations truncated; see annotations.md ...]";
+		}
+
 		return (
-			"You are embedded in the Zotero reference manager as a sidebar assistant, helping the " +
-			"user understand one paper. Its metadata and the user's annotations are included " +
-			"below, so do not use any tools. The paper's full text is deliberately not provided: " +
-			"answer from these and your own knowledge, and say so when a question needs details " +
-			"only the full text would have. Keep answers focused on this paper. " +
+			intro +
 			this.languageInstruction() + " " + this.behaviourInstructions() + "\n\n" + this.formattingGuide() + "\n\n" +
-			"<metadata>\n" + files.metadata + "</metadata>\n\n" +
-			(files.annotations ? "<annotations>\n" + files.annotations + "\n</annotations>\n\n" : "") +
+			(files && files.metadata ? "<metadata>\n" + files.metadata + "</metadata>\n\n" : "") +
+			(annotations ? "<annotations>\n" + annotations + "\n</annotations>\n\n" : "") +
 			"---\n\n" + tail
 		);
 	},
